@@ -63,6 +63,7 @@ def _get_vercel_request_class() -> Any:
             output_tools: list[FrontendTool] | None = None
             system: str | None = None
             session_id: str | None = None
+            export_remote_traces: bool = False
             ingest_traces: bool = True
             trace_name_suffix: str = "Turn"
 
@@ -79,6 +80,7 @@ class ChatBody:
     output_tools: list[FrontendTool] | None = None
     system: str | None = None
     session_id: str | None = None
+    export_remote_traces: bool = False
     ingest_traces: bool = True
     trace_name_suffix: str = "Turn"
     raw_tools: list[dict[str, Any]] = field(default_factory=list)
@@ -103,7 +105,7 @@ def parse_chat_body(raw_body: bytes) -> ChatBody:
     """Parse the raw request body into a structured ``ChatBody``.
 
     Separates body parsing from streaming so callers can access fields like
-    ``session_id`` and ``ingest_traces`` before entering the generator.
+    ``session_id`` and the local/remote trace flags before entering the generator.
     """
     from pydantic_ai.messages import ModelRequest, SystemPromptPart
     from pydantic_ai.ui.vercel_ai._adapter import VercelAIAdapter
@@ -136,6 +138,7 @@ def parse_chat_body(raw_body: bytes) -> ChatBody:
         output_tools=body.output_tools,
         system=body.system,
         session_id=body.session_id,
+        export_remote_traces=body.export_remote_traces,
         ingest_traces=body.ingest_traces,
         trace_name_suffix=body.trace_name_suffix,
         raw_tools=raw_tools,
@@ -419,6 +422,8 @@ async def stream_text(
         )
 
     ingest_traces = body.ingest_traces
+    export_remote_traces = body.export_remote_traces
+    should_trace = ingest_traces or export_remote_traces
 
     # Maximum backend tool loop iterations to prevent runaway loops.
     _MAX_BACKEND_TOOL_LOOPS = 5
@@ -448,14 +453,15 @@ async def stream_text(
         llm_call_count = 0
 
         # Set up tracing before streaming begins.
-        if ingest_traces:
+        if should_trace:
             try:
                 tracer = Tracer(
                     span_cost_calculator=request.app.state.span_cost_calculator,
-                    enable_remote_export=True,
+                    enable_remote_export=export_remote_traces,
                     project_name=get_env_phoenix_agents_assistant_project_name(),
                 )
-                project_id = await ensure_project_exists(request.app.state.db)
+                if ingest_traces:
+                    project_id = await ensure_project_exists(request.app.state.db)
                 agent_span = create_agent_span(
                     tracer,
                     input_messages=messages,
@@ -692,17 +698,18 @@ async def stream_text(
         yield _sse(DoneChunk())
 
         # Persist traces and shut down the tracer to release resources.
-        if tracer is not None and project_id is not None:
+        if tracer is not None:
             from phoenix.server.api.routers.chat_tracing import persist_traces
 
             try:
-                await persist_traces(
-                    tracer,
-                    db=request.app.state.db,
-                    project_id=project_id,
-                    session_id=body.session_id,
-                    event_queue=request.state.event_queue,
-                )
+                if ingest_traces and project_id is not None:
+                    await persist_traces(
+                        tracer,
+                        db=request.app.state.db,
+                        project_id=project_id,
+                        session_id=body.session_id,
+                        event_queue=request.state.event_queue,
+                    )
             finally:
                 try:
                     # BatchSpanProcessor.shutdown() blocks on _worker_thread.join()
